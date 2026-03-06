@@ -66,7 +66,8 @@ def save_config(cfg: dict):
 def get_paired_devices() -> list[dict]:
     """
     Enumerate paired Bluetooth devices via PowerShell.
-    Returns list of dicts with 'name' and 'address'.
+    Returns deduplicated list of dicts with 'name', 'instance_id', 'status'.
+    Filters out transport/service entries to show only actual devices.
     """
     ps_script = (
         "Get-PnpDevice -Class Bluetooth | "
@@ -74,6 +75,15 @@ def get_paired_devices() -> list[dict]:
         "Select-Object FriendlyName, InstanceId, Status | "
         "ConvertTo-Json -Compress"
     )
+    # Patterns that indicate transport/service entries, not real devices
+    SKIP_PATTERNS = {
+        "avrcp transport", "avrcp", "handsfree", "a2dp",
+        "phonebook access", "service discovery",
+        "network nap", "personal area network",
+        "serial port", "object push", "dial-up",
+        "headset gateway", "audio sink", "audio source",
+        "human interface", "hid device",
+    }
     try:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
@@ -89,18 +99,27 @@ def get_paired_devices() -> list[dict]:
         data = json.loads(raw)
         if isinstance(data, dict):
             data = [data]
-        devices = []
+
+        # Group by device name, prefer entries with status OK
+        seen_names: dict[str, dict] = {}
         for d in data:
             name = d.get("FriendlyName", "Unknown")
             instance_id = d.get("InstanceId", "")
             status = d.get("Status", "Unknown")
-            if instance_id:
-                devices.append({
+            if not instance_id:
+                continue
+            # Skip transport/service profile entries
+            name_lower = name.lower()
+            if any(skip in name_lower for skip in SKIP_PATTERNS):
+                continue
+            # Keep the best entry per device name (prefer connected)
+            if name not in seen_names or status == "OK":
+                seen_names[name] = {
                     "name": name,
                     "instance_id": instance_id,
                     "status": status,
-                })
-        return devices
+                }
+        return list(seen_names.values())
     except Exception as e:
         logger.error("Error enumerating Bluetooth devices: %s", e)
         return []
@@ -218,6 +237,330 @@ def create_icon_image(connected: bool = False) -> Image.Image:
     return img
 
 
+# ── Native Win32 device picker dialog ──────────────────────────────────────────
+def _show_device_picker(devices: list[dict]) -> int | None:
+    """
+    Show a native Win32 dialog with a listbox of Bluetooth devices.
+    Each entry shows the device name and its status (Connected / Disconnected).
+    Returns the selected index, or None if cancelled.
+    """
+    import ctypes.wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    gdi32 = ctypes.windll.gdi32
+
+    # Win32 constants
+    WS_OVERLAPPED = 0x00000000
+    WS_CAPTION = 0x00C00000
+    WS_SYSMENU = 0x00080000
+    WS_VISIBLE = 0x10000000
+    WS_CHILD = 0x40000000
+    WS_VSCROLL = 0x00200000
+    WS_BORDER = 0x00800000
+    WS_TABSTOP = 0x00010000
+    WS_EX_DLGMODALFRAME = 0x00000001
+    LBS_NOTIFY = 0x0001
+    LBS_NOINTEGRALHEIGHT = 0x0100
+    LBS_OWNERDRAWFIXED = 0x0010
+    LBS_HASSTRINGS = 0x0040
+    BS_DEFPUSHBUTTON = 0x0001
+    BS_PUSHBUTTON = 0x0000
+    WM_CREATE = 0x0001
+    WM_DESTROY = 0x0002
+    WM_CLOSE = 0x0010
+    WM_COMMAND = 0x0111
+    WM_SETFONT = 0x0030
+    WM_DRAWITEM = 0x002B
+    WM_MEASUREITEM = 0x002C
+    WM_CTLCOLORLISTBOX = 0x0134
+    WM_CTLCOLORBTN = 0x0135
+    WM_CTLCOLORSTATIC = 0x0138
+    WM_CTLCOLORDLG = 0x0136
+    WM_ERASEBKGND = 0x0014
+    LB_ADDSTRING = 0x0180
+    LB_GETCURSEL = 0x0188
+    LB_SETCURSEL = 0x0186
+    LB_SETITEMDATA = 0x019A
+    LB_GETITEMDATA = 0x0199
+    LBN_DBLCLK = 2
+    BN_CLICKED = 0
+    SW_SHOW = 5
+    COLOR_WINDOW = 5
+    ODA_DRAWENTIRE = 0x0001
+    ODA_SELECT = 0x0002
+    ODA_FOCUS = 0x0004
+    ODT_LISTBOX = 2
+    ODS_SELECTED = 0x0001
+
+    WNDPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_long,
+        ctypes.wintypes.HWND,
+        ctypes.c_uint,
+        ctypes.wintypes.WPARAM,
+        ctypes.wintypes.LPARAM,
+    )
+
+    ID_LISTBOX = 100
+    ID_OK = 101
+    ID_CANCEL = 102
+
+    result_holder = [None]
+    hwnd_listbox = [None]
+
+    # Dark theme colors
+    BG_COLOR = 0x00282828        # #282828 (dark bg)
+    TEXT_COLOR = 0x00FFFFFF       # white text
+    ACCENT_COLOR = 0x00D77800    # #0078D7 (blue accent) — BGR
+    ITEM_BG = 0x00323232         # #323232 (item bg)
+    CONNECTED_COLOR = 0x0066CC66  # green — BGR
+    DISCONNECTED_COLOR = 0x005050AA  # muted red — BGR
+    SEPARATOR_COLOR = 0x00444444
+
+    bg_brush = gdi32.CreateSolidBrush(BG_COLOR)
+    item_brush = gdi32.CreateSolidBrush(ITEM_BG)
+    accent_brush = gdi32.CreateSolidBrush(ACCENT_COLOR)
+
+    class DRAWITEMSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("CtlType", ctypes.c_uint),
+            ("CtlID", ctypes.c_uint),
+            ("itemID", ctypes.c_uint),
+            ("itemAction", ctypes.c_uint),
+            ("itemState", ctypes.c_uint),
+            ("hwndItem", ctypes.wintypes.HWND),
+            ("hDC", ctypes.wintypes.HDC),
+            ("rcItem", ctypes.wintypes.RECT),
+            ("itemData", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    class MEASUREITEMSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("CtlType", ctypes.c_uint),
+            ("CtlID", ctypes.c_uint),
+            ("itemID", ctypes.c_uint),
+            ("itemWidth", ctypes.c_uint),
+            ("itemHeight", ctypes.c_uint),
+            ("itemData", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    def wnd_proc(hwnd, msg, wparam, lparam):
+        if msg == WM_CREATE:
+            return 0
+
+        elif msg == WM_ERASEBKGND:
+            hdc = wparam
+            rect = ctypes.wintypes.RECT()
+            user32.GetClientRect(hwnd, ctypes.byref(rect))
+            user32.FillRect(hdc, ctypes.byref(rect), bg_brush)
+            return 1
+
+        elif msg == WM_CTLCOLORLISTBOX:
+            hdc = wparam
+            gdi32.SetTextColor(hdc, TEXT_COLOR)
+            gdi32.SetBkColor(hdc, ITEM_BG)
+            return item_brush
+
+        elif msg in (WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_CTLCOLORDLG):
+            hdc = wparam
+            gdi32.SetTextColor(hdc, TEXT_COLOR)
+            gdi32.SetBkColor(hdc, BG_COLOR)
+            return bg_brush
+
+        elif msg == WM_MEASUREITEM:
+            mis = ctypes.cast(lparam, ctypes.POINTER(MEASUREITEMSTRUCT)).contents
+            mis.itemHeight = 48
+            return 1
+
+        elif msg == WM_DRAWITEM:
+            dis = ctypes.cast(lparam, ctypes.POINTER(DRAWITEMSTRUCT)).contents
+            if dis.CtlID != ID_LISTBOX:
+                return 0
+
+            hdc = dis.hDC
+            rc = dis.rcItem
+            selected = bool(dis.itemState & ODS_SELECTED)
+            idx = dis.itemID
+
+            if idx >= len(devices):
+                return 0
+
+            # Background
+            fill_brush = accent_brush if selected else item_brush
+            user32.FillRect(hdc, ctypes.byref(rc), fill_brush)
+
+            # Draw separator line at bottom
+            sep_rect = ctypes.wintypes.RECT(rc.left, rc.bottom - 1, rc.right, rc.bottom)
+            sep_brush = gdi32.CreateSolidBrush(SEPARATOR_COLOR)
+            user32.FillRect(hdc, ctypes.byref(sep_rect), sep_brush)
+            gdi32.DeleteObject(sep_brush)
+
+            gdi32.SetBkMode(hdc, 1)  # TRANSPARENT
+
+            dev = devices[idx]
+            name = dev["name"]
+            is_connected = dev.get("status", "Unknown") == "OK"
+            status_text = "Connected" if is_connected else "Disconnected"
+
+            # Draw device name (bold, larger)
+            name_font = gdi32.CreateFontW(
+                -18, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, "Segoe UI"
+            )
+            old_font = gdi32.SelectObject(hdc, name_font)
+            gdi32.SetTextColor(hdc, 0x00FFFFFF if selected else 0x00EEEEEE)
+            name_rect = ctypes.wintypes.RECT(rc.left + 14, rc.top + 6, rc.right - 14, rc.top + 28)
+            user32.DrawTextW(hdc, name, -1, ctypes.byref(name_rect), 0x0000)
+            gdi32.SelectObject(hdc, old_font)
+            gdi32.DeleteObject(name_font)
+
+            # Draw status (smaller, colored)
+            status_font = gdi32.CreateFontW(
+                -13, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, "Segoe UI"
+            )
+            old_font2 = gdi32.SelectObject(hdc, status_font)
+            status_color = CONNECTED_COLOR if is_connected else DISCONNECTED_COLOR
+            gdi32.SetTextColor(hdc, status_color)
+            status_rect = ctypes.wintypes.RECT(rc.left + 14, rc.top + 27, rc.right - 14, rc.bottom - 4)
+            # Draw a small circle indicator
+            indicator = "\u25CF "  # ● bullet
+            full_status = indicator + status_text
+            user32.DrawTextW(hdc, full_status, -1, ctypes.byref(status_rect), 0x0000)
+            gdi32.SelectObject(hdc, old_font2)
+            gdi32.DeleteObject(status_font)
+
+            return 1
+
+        elif msg == WM_COMMAND:
+            control_id = wparam & 0xFFFF
+            notify_code = (wparam >> 16) & 0xFFFF
+
+            if control_id == ID_OK and notify_code == BN_CLICKED:
+                sel = user32.SendMessageW(hwnd_listbox[0], LB_GETCURSEL, 0, 0)
+                if sel >= 0:
+                    result_holder[0] = sel
+                user32.DestroyWindow(hwnd)
+                return 0
+
+            if control_id == ID_CANCEL and notify_code == BN_CLICKED:
+                user32.DestroyWindow(hwnd)
+                return 0
+
+            if control_id == ID_LISTBOX and notify_code == LBN_DBLCLK:
+                sel = user32.SendMessageW(hwnd_listbox[0], LB_GETCURSEL, 0, 0)
+                if sel >= 0:
+                    result_holder[0] = sel
+                user32.DestroyWindow(hwnd)
+                return 0
+
+        elif msg == WM_CLOSE:
+            user32.DestroyWindow(hwnd)
+            return 0
+
+        elif msg == WM_DESTROY:
+            user32.PostQuitMessage(0)
+            return 0
+
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    # prevent GC of the callback
+    wnd_proc_cb = WNDPROC(wnd_proc)
+
+    class_name = f"{APP_NAME}_DevicePicker"
+    wc = ctypes.wintypes.WNDCLASSW()
+    wc.lpfnWndProc = wnd_proc_cb
+    wc.hInstance = kernel32.GetModuleHandleW(None)
+    wc.lpszClassName = class_name
+    wc.hCursor = user32.LoadCursorW(None, 32512)  # IDC_ARROW
+    wc.hbrBackground = bg_brush
+
+    user32.RegisterClassW(ctypes.byref(wc))
+
+    # Center on screen
+    dlg_w, dlg_h = 420, 480
+    screen_w = user32.GetSystemMetrics(0)
+    screen_h = user32.GetSystemMetrics(1)
+    x = (screen_w - dlg_w) // 2
+    y = (screen_h - dlg_h) // 2
+
+    hwnd = user32.CreateWindowExW(
+        WS_EX_DLGMODALFRAME,
+        class_name,
+        "Select Bluetooth Device",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        x, y, dlg_w, dlg_h,
+        None, None, wc.hInstance, None,
+    )
+
+    # UI font
+    ui_font = gdi32.CreateFontW(-14, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, "Segoe UI")
+
+    # Label
+    h_label = user32.CreateWindowExW(
+        0, "STATIC",
+        "Select a paired device to monitor for auto-reconnect:",
+        WS_CHILD | WS_VISIBLE,
+        14, 12, 380, 22,
+        hwnd, None, wc.hInstance, None,
+    )
+    user32.SendMessageW(h_label, WM_SETFONT, ui_font, 1)
+
+    # Listbox (owner-drawn)
+    lb_style = (
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WS_TABSTOP
+        | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS
+    )
+    h_listbox = user32.CreateWindowExW(
+        0, "LISTBOX", None,
+        lb_style,
+        14, 40, 378, 340,
+        hwnd, ID_LISTBOX, wc.hInstance, None,
+    )
+    hwnd_listbox[0] = h_listbox
+
+    for i, dev in enumerate(devices):
+        label = dev["name"]
+        user32.SendMessageW(h_listbox, LB_ADDSTRING, 0, label)
+
+    # Select first item
+    user32.SendMessageW(h_listbox, LB_SETCURSEL, 0, 0)
+
+    # Buttons
+    btn_font = gdi32.CreateFontW(-14, 0, 0, 0, 600, 0, 0, 0, 0, 0, 0, 0, 0, "Segoe UI")
+
+    h_ok = user32.CreateWindowExW(
+        0, "BUTTON", "Add Device",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        142, 395, 120, 36,
+        hwnd, ID_OK, wc.hInstance, None,
+    )
+    user32.SendMessageW(h_ok, WM_SETFONT, btn_font, 1)
+
+    h_cancel = user32.CreateWindowExW(
+        0, "BUTTON", "Cancel",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        272, 395, 120, 36,
+        hwnd, ID_CANCEL, wc.hInstance, None,
+    )
+    user32.SendMessageW(h_cancel, WM_SETFONT, btn_font, 1)
+
+    # Message loop
+    msg = ctypes.wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        if not user32.IsDialogMessageW(hwnd, ctypes.byref(msg)):
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    # Cleanup
+    gdi32.DeleteObject(ui_font)
+    gdi32.DeleteObject(btn_font)
+    gdi32.DeleteObject(bg_brush)
+    gdi32.DeleteObject(item_brush)
+    gdi32.DeleteObject(accent_brush)
+    user32.UnregisterClassW(class_name, wc.hInstance)
+
+    return result_holder[0]
+
+
 class BluetoothPersistenceApp:
     def __init__(self):
         self.config = load_config()
@@ -304,49 +647,22 @@ class BluetoothPersistenceApp:
                 "No additional paired Bluetooth devices found.\n\n"
                 "Make sure your device is paired in Windows Bluetooth settings.",
                 APP_DISPLAY_NAME,
-                0x40,  # MB_ICONINFORMATION
+                0x40,
             )
             return
 
-        # Build selection list
-        lines = ["Select a device to monitor:\n"]
-        for i, dev in enumerate(available, 1):
-            lines.append(f"  {i}. {dev['name']} ({dev['status']})")
-        lines.append(f"\nEnter a number (1-{len(available)}):")
-
-        # Use a simple input box via PowerShell
-        prompt_text = "\\n".join(lines).replace('"', '`"')
-        ps_cmd = (
-            f'Add-Type -AssemblyName Microsoft.VisualBasic; '
-            f'[Microsoft.VisualBasic.Interaction]::InputBox('
-            f'"{prompt_text}", "{APP_DISPLAY_NAME}", "1")'
-        )
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_cmd],
-                capture_output=True, text=True, timeout=120,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            choice = result.stdout.strip()
-            if not choice:
-                return
-            idx = int(choice) - 1
-            if 0 <= idx < len(available):
-                dev = available[idx]
-                with self._lock:
-                    self.config.setdefault("devices", []).append({
-                        "name": dev["name"],
-                        "instance_id": dev["instance_id"],
-                    })
-                    save_config(self.config)
-                logger.info("Added device: %s (%s)", dev["name"], dev["instance_id"])
+        selected_index = _show_device_picker(available)
+        if selected_index is not None and 0 <= selected_index < len(available):
+            dev = available[selected_index]
+            with self._lock:
+                self.config.setdefault("devices", []).append({
+                    "name": dev["name"],
+                    "instance_id": dev["instance_id"],
+                })
+                save_config(self.config)
+            logger.info("Added device: %s (%s)", dev["name"], dev["instance_id"])
+            if self.icon:
                 self.icon.notify(f"Now monitoring: {dev['name']}", APP_DISPLAY_NAME)
-            else:
-                ctypes.windll.user32.MessageBoxW(
-                    0, "Invalid selection.", APP_DISPLAY_NAME, 0x30
-                )
-        except (ValueError, subprocess.TimeoutExpired):
-            pass
 
     def _remove_device(self, instance_id: str, name: str):
         """Remove a device from monitoring."""
