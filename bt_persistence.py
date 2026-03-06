@@ -639,13 +639,17 @@ class BluetoothPersistenceApp:
     def _add_device_dialog(self):
         devices = get_paired_devices()
         monitored_ids = {d["instance_id"] for d in self.config.get("devices", [])}
-        available = [d for d in devices if d["instance_id"] not in monitored_ids]
+        # Only show devices that are currently connected AND not already monitored
+        available = [
+            d for d in devices
+            if d["instance_id"] not in monitored_ids and d.get("status") == "OK"
+        ]
 
         if not available:
             ctypes.windll.user32.MessageBoxW(
                 0,
-                "No additional paired Bluetooth devices found.\n\n"
-                "Make sure your device is paired in Windows Bluetooth settings.",
+                "No connected Bluetooth devices available to add.\n\n"
+                "Make sure your device is paired and connected in Windows Bluetooth settings.",
                 APP_DISPLAY_NAME,
                 0x40,
             )
