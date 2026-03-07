@@ -637,36 +637,42 @@ class BluetoothPersistenceApp:
         threading.Thread(target=self._add_device_dialog, daemon=True).start()
 
     def _add_device_dialog(self):
-        devices = get_paired_devices()
-        monitored_ids = {d["instance_id"] for d in self.config.get("devices", [])}
-        # Only show devices that are currently connected AND not already monitored
-        available = [
-            d for d in devices
-            if d["instance_id"] not in monitored_ids and d.get("status") == "OK"
-        ]
+        try:
+            logger.info("Add Device dialog requested.")
+            devices = get_paired_devices()
+            logger.info("Found %d paired device(s).", len(devices))
+            monitored_ids = {d["instance_id"] for d in self.config.get("devices", [])}
+            # Show all paired devices that are not already monitored
+            available = [
+                d for d in devices
+                if d["instance_id"] not in monitored_ids
+            ]
+            logger.info("Available (not already monitored): %d", len(available))
 
-        if not available:
-            ctypes.windll.user32.MessageBoxW(
-                0,
-                "No connected Bluetooth devices available to add.\n\n"
-                "Make sure your device is paired and connected in Windows Bluetooth settings.",
-                APP_DISPLAY_NAME,
-                0x40,
-            )
-            return
+            if not available:
+                ctypes.windll.user32.MessageBoxW(
+                    0,
+                    "No Bluetooth devices available to add.\n\n"
+                    "Make sure your device is paired in Windows Bluetooth settings.",
+                    APP_DISPLAY_NAME,
+                    0x40,
+                )
+                return
 
-        selected_index = _show_device_picker(available)
-        if selected_index is not None and 0 <= selected_index < len(available):
-            dev = available[selected_index]
-            with self._lock:
-                self.config.setdefault("devices", []).append({
-                    "name": dev["name"],
-                    "instance_id": dev["instance_id"],
-                })
-                save_config(self.config)
-            logger.info("Added device: %s (%s)", dev["name"], dev["instance_id"])
-            if self.icon:
-                self.icon.notify(f"Now monitoring: {dev['name']}", APP_DISPLAY_NAME)
+            selected_index = _show_device_picker(available)
+            if selected_index is not None and 0 <= selected_index < len(available):
+                dev = available[selected_index]
+                with self._lock:
+                    self.config.setdefault("devices", []).append({
+                        "name": dev["name"],
+                        "instance_id": dev["instance_id"],
+                    })
+                    save_config(self.config)
+                logger.info("Added device: %s (%s)", dev["name"], dev["instance_id"])
+                if self.icon:
+                    self.icon.notify(f"Now monitoring: {dev['name']}", APP_DISPLAY_NAME)
+        except Exception:
+            logger.exception("Error in Add Device dialog")
 
     def _remove_device(self, instance_id: str, name: str):
         """Remove a device from monitoring."""
