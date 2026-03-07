@@ -347,7 +347,10 @@ def _show_device_picker(devices: list[dict]) -> int | None:
     kernel32 = ctypes.windll.kernel32
     gdi32 = ctypes.windll.gdi32
 
-    # 64-bit compatibility: only set argtypes on calls that overflow without them
+    # ── 64-bit compatibility: set argtypes/restype for ALL Win32 calls ──
+    kernel32.GetModuleHandleW.argtypes = [ctypes.wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = ctypes.wintypes.HINSTANCE
+
     user32.CreateWindowExW.argtypes = [
         ctypes.wintypes.DWORD, ctypes.wintypes.LPCWSTR, ctypes.wintypes.LPCWSTR,
         ctypes.wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -355,13 +358,55 @@ def _show_device_picker(devices: list[dict]) -> int | None:
         ctypes.c_void_p,
     ]
     user32.CreateWindowExW.restype = ctypes.wintypes.HWND
+
     user32.DefWindowProcW.argtypes = [
         ctypes.wintypes.HWND, ctypes.c_uint,
         ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
     ]
     user32.DefWindowProcW.restype = ctypes.c_longlong
-    kernel32.GetModuleHandleW.argtypes = [ctypes.wintypes.LPCWSTR]
-    kernel32.GetModuleHandleW.restype = ctypes.wintypes.HINSTANCE
+
+    user32.SendMessageW.argtypes = [
+        ctypes.wintypes.HWND, ctypes.c_uint,
+        ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
+    ]
+    user32.SendMessageW.restype = ctypes.c_longlong
+
+    user32.RegisterClassW.argtypes = [ctypes.c_void_p]
+    user32.RegisterClassW.restype = ctypes.wintypes.ATOM
+
+    user32.UnregisterClassW.argtypes = [ctypes.wintypes.LPCWSTR, ctypes.wintypes.HINSTANCE]
+    user32.UnregisterClassW.restype = ctypes.wintypes.BOOL
+
+    user32.LoadCursorW.argtypes = [ctypes.wintypes.HINSTANCE, ctypes.wintypes.LPCWSTR]
+    user32.LoadCursorW.restype = ctypes.wintypes.HANDLE
+
+    user32.DestroyWindow.argtypes = [ctypes.wintypes.HWND]
+    user32.DestroyWindow.restype = ctypes.wintypes.BOOL
+
+    user32.PostQuitMessage.argtypes = [ctypes.c_int]
+    user32.PostQuitMessage.restype = None
+
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.GetSystemMetrics.restype = ctypes.c_int
+
+    user32.GetMessageW.argtypes = [
+        ctypes.POINTER(ctypes.wintypes.MSG), ctypes.wintypes.HWND,
+        ctypes.c_uint, ctypes.c_uint,
+    ]
+    user32.GetMessageW.restype = ctypes.wintypes.BOOL
+
+    user32.IsDialogMessageW.argtypes = [ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.MSG)]
+    user32.IsDialogMessageW.restype = ctypes.wintypes.BOOL
+
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(ctypes.wintypes.MSG)]
+    user32.TranslateMessage.restype = ctypes.wintypes.BOOL
+
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(ctypes.wintypes.MSG)]
+    user32.DispatchMessageW.restype = ctypes.c_longlong
+
+    gdi32.CreateFontW.restype = ctypes.wintypes.HFONT
+    gdi32.DeleteObject.argtypes = [ctypes.wintypes.HANDLE]
+    gdi32.DeleteObject.restype = ctypes.wintypes.BOOL
 
     # Win32 constants
     WS_OVERLAPPED = 0x00000000
@@ -458,7 +503,7 @@ def _show_device_picker(devices: list[dict]) -> int | None:
     wc.lpfnWndProc = wnd_proc_cb
     wc.hInstance = hInstance
     wc.lpszClassName = class_name
-    wc.hCursor = user32.LoadCursorW(None, 32512)
+    wc.hCursor = user32.LoadCursorW(None, ctypes.wintypes.LPCWSTR(32512))
     wc.hbrBackground = ctypes.wintypes.HBRUSH(6)  # COLOR_BTNFACE + 1
 
     user32.RegisterClassW(ctypes.byref(wc))
@@ -480,6 +525,7 @@ def _show_device_picker(devices: list[dict]) -> int | None:
     )
 
     ui_font = gdi32.CreateFontW(-16, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, "Segoe UI")
+    font_wparam = ctypes.cast(ui_font, ctypes.c_void_p).value or 0
 
     # Label
     h_label = user32.CreateWindowExW(
@@ -489,7 +535,7 @@ def _show_device_picker(devices: list[dict]) -> int | None:
         14, 10, 360, 22,
         hwnd, None, hInstance, None,
     )
-    user32.SendMessageW(h_label, WM_SETFONT, ui_font, 1)
+    user32.SendMessageW(h_label, WM_SETFONT, font_wparam, 1)
 
     # Standard listbox (no owner-draw)
     lb_style = (
@@ -503,18 +549,23 @@ def _show_device_picker(devices: list[dict]) -> int | None:
         hwnd, ctypes.wintypes.HMENU(ID_LISTBOX), hInstance, None,
     )
     hwnd_listbox[0] = h_listbox
-    user32.SendMessageW(h_listbox, WM_SETFONT, ui_font, 1)
+    user32.SendMessageW(h_listbox, WM_SETFONT, font_wparam, 1)
 
     # Add items as formatted text strings
+    _label_refs = []  # prevent GC of string buffers
     for dev in devices:
         status = "\u2713 Connected" if dev.get("status") == "OK" else "\u2717 Disconnected"
         label = f"{dev['name']}  —  {status}"
-        user32.SendMessageW(h_listbox, LB_ADDSTRING, 0, label)
+        buf = ctypes.c_wchar_p(label)
+        _label_refs.append(buf)
+        lp_str = ctypes.cast(buf, ctypes.c_void_p).value or 0
+        user32.SendMessageW(h_listbox, LB_ADDSTRING, 0, lp_str)
 
     user32.SendMessageW(h_listbox, LB_SETCURSEL, 0, 0)
 
     # Buttons
     btn_font = gdi32.CreateFontW(-14, 0, 0, 0, 600, 0, 0, 0, 0, 0, 0, 0, 0, "Segoe UI")
+    btn_font_wparam = ctypes.cast(btn_font, ctypes.c_void_p).value or 0
 
     h_ok = user32.CreateWindowExW(
         0, "BUTTON", "Add Device",
@@ -522,7 +573,7 @@ def _show_device_picker(devices: list[dict]) -> int | None:
         130, 290, 110, 34,
         hwnd, ctypes.wintypes.HMENU(ID_OK), hInstance, None,
     )
-    user32.SendMessageW(h_ok, WM_SETFONT, btn_font, 1)
+    user32.SendMessageW(h_ok, WM_SETFONT, btn_font_wparam, 1)
 
     h_cancel = user32.CreateWindowExW(
         0, "BUTTON", "Cancel",
@@ -530,7 +581,7 @@ def _show_device_picker(devices: list[dict]) -> int | None:
         250, 290, 110, 34,
         hwnd, ctypes.wintypes.HMENU(ID_CANCEL), hInstance, None,
     )
-    user32.SendMessageW(h_cancel, WM_SETFONT, btn_font, 1)
+    user32.SendMessageW(h_cancel, WM_SETFONT, btn_font_wparam, 1)
 
     # Message loop
     msg = ctypes.wintypes.MSG()
