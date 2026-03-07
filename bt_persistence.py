@@ -219,21 +219,9 @@ def get_paired_devices() -> list[dict]:
         return []
 
 
-def is_device_connected(instance_id: str) -> bool:
-    """Check if a specific Bluetooth device is connected using Windows Bluetooth API."""
-    # Get the device name from PnP, then check against BT API
-    ps_script = (
-        f"(Get-PnpDevice -InstanceId '{instance_id}' -ErrorAction SilentlyContinue).FriendlyName"
-    )
+def is_device_connected(name: str) -> bool:
+    """Check if a Bluetooth device is connected by name using Windows Bluetooth API."""
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-            capture_output=True, text=True, timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        name = result.stdout.strip()
-        if not name:
-            return False
         connected_names = _get_connected_bt_names()
         return name in connected_names
     except Exception as e:
@@ -241,11 +229,128 @@ def is_device_connected(instance_id: str) -> bool:
         return False
 
 
-def reconnect_device(instance_id: str) -> bool:
+def reconnect_device(name: str, instance_id: str) -> bool:
     """
-    Attempt to reconnect a Bluetooth device by disabling and re-enabling it.
+    Attempt to reconnect a Bluetooth device.
+    Tries multiple methods: BT API service toggle, then PnP disable/enable.
     """
-    # Validate instance_id format to prevent injection
+    # Method 1: Use Bluetooth API to trigger reconnection
+    try:
+        bt = ctypes.WinDLL("bthprops.cpl")
+    except OSError:
+        try:
+            bt = ctypes.WinDLL("BluetoothAPIs.dll")
+        except OSError:
+            bt = None
+
+    if bt:
+        try:
+            class SYSTEMTIME(ctypes.Structure):
+                _fields_ = [
+                    ("wYear", ctypes.c_ushort), ("wMonth", ctypes.c_ushort),
+                    ("wDayOfWeek", ctypes.c_ushort), ("wDay", ctypes.c_ushort),
+                    ("wHour", ctypes.c_ushort), ("wMinute", ctypes.c_ushort),
+                    ("wSecond", ctypes.c_ushort), ("wMilliseconds", ctypes.c_ushort),
+                ]
+
+            class BLUETOOTH_DEVICE_INFO(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", ctypes.c_ulong),
+                    ("Address", ctypes.c_ulonglong),
+                    ("ulClassofDevice", ctypes.c_ulong),
+                    ("fConnected", ctypes.c_int),
+                    ("fRemembered", ctypes.c_int),
+                    ("fAuthenticated", ctypes.c_int),
+                    ("stLastSeen", SYSTEMTIME),
+                    ("stLastUsed", SYSTEMTIME),
+                    ("szName", ctypes.c_wchar * 248),
+                ]
+
+            class BLUETOOTH_DEVICE_SEARCH_PARAMS(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", ctypes.c_ulong),
+                    ("fReturnAuthenticated", ctypes.c_int),
+                    ("fReturnRemembered", ctypes.c_int),
+                    ("fReturnUnknown", ctypes.c_int),
+                    ("fReturnConnected", ctypes.c_int),
+                    ("fIssueInquiry", ctypes.c_int),
+                    ("cTimeoutMultiplier", ctypes.c_ubyte),
+                    ("hRadio", ctypes.c_void_p),
+                ]
+
+            bt.BluetoothFindFirstDevice.restype = ctypes.c_void_p
+            bt.BluetoothFindFirstDevice.argtypes = [
+                ctypes.POINTER(BLUETOOTH_DEVICE_SEARCH_PARAMS),
+                ctypes.POINTER(BLUETOOTH_DEVICE_INFO),
+            ]
+            bt.BluetoothFindNextDevice.restype = ctypes.c_int
+            bt.BluetoothFindNextDevice.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(BLUETOOTH_DEVICE_INFO),
+            ]
+            bt.BluetoothFindDeviceClose.restype = ctypes.c_int
+            bt.BluetoothFindDeviceClose.argtypes = [ctypes.c_void_p]
+
+            # Find the device by name among remembered devices
+            params = BLUETOOTH_DEVICE_SEARCH_PARAMS()
+            params.dwSize = ctypes.sizeof(BLUETOOTH_DEVICE_SEARCH_PARAMS)
+            params.fReturnRemembered = 1
+            params.fReturnAuthenticated = 1
+            params.fReturnConnected = 1
+            params.fReturnUnknown = 0
+            params.fIssueInquiry = 0
+            params.cTimeoutMultiplier = 0
+            params.hRadio = None
+
+            dev = BLUETOOTH_DEVICE_INFO()
+            dev.dwSize = ctypes.sizeof(BLUETOOTH_DEVICE_INFO)
+
+            target_dev = None
+            hFind = bt.BluetoothFindFirstDevice(ctypes.byref(params), ctypes.byref(dev))
+            if hFind:
+                if dev.szName == name:
+                    target_dev = BLUETOOTH_DEVICE_INFO()
+                    ctypes.memmove(ctypes.byref(target_dev), ctypes.byref(dev), ctypes.sizeof(BLUETOOTH_DEVICE_INFO))
+                while not target_dev and bt.BluetoothFindNextDevice(hFind, ctypes.byref(dev)):
+                    if dev.szName == name:
+                        target_dev = BLUETOOTH_DEVICE_INFO()
+                        ctypes.memmove(ctypes.byref(target_dev), ctypes.byref(dev), ctypes.sizeof(BLUETOOTH_DEVICE_INFO))
+                bt.BluetoothFindDeviceClose(hFind)
+
+            if target_dev:
+                # GUID for Bluetooth HFP (Handsfree), A2DP, and generic audio
+                GUIDS = [
+                    "{0000111E-0000-1000-8000-00805F9B34FB}",  # Handsfree
+                    "{0000110B-0000-1000-8000-00805F9B34FB}",  # A2DP Sink
+                    "{0000110A-0000-1000-8000-00805F9B34FB}",  # A2DP Source
+                ]
+                # Try toggling Bluetooth services to trigger reconnection
+                bt.BluetoothSetServiceState.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(BLUETOOTH_DEVICE_INFO),
+                    ctypes.POINTER(ctypes.c_byte * 16), ctypes.c_ulong,
+                ]
+                bt.BluetoothSetServiceState.restype = ctypes.c_ulong
+
+                for guid_str in GUIDS:
+                    try:
+                        import uuid
+                        guid_bytes = uuid.UUID(guid_str).bytes_le
+                        guid_arr = (ctypes.c_byte * 16)(*guid_bytes)
+                        # Disable then enable the service
+                        bt.BluetoothSetServiceState(None, ctypes.byref(target_dev), ctypes.byref(guid_arr), 0)
+                        time.sleep(0.5)
+                        result = bt.BluetoothSetServiceState(None, ctypes.byref(target_dev), ctypes.byref(guid_arr), 1)
+                        logger.info("BluetoothSetServiceState for %s GUID %s: %d", name, guid_str, result)
+                    except Exception as ex:
+                        logger.debug("Service toggle failed for GUID %s: %s", guid_str, ex)
+
+                logger.info("BT API reconnect attempted for '%s'", name)
+                return True
+            else:
+                logger.warning("Device '%s' not found via BT API for reconnect", name)
+        except Exception as e:
+            logger.error("BT API reconnect error for %s: %s", name, e)
+
+    # Method 2: Fallback to PnP disable/enable
     if not instance_id or not instance_id.startswith("BTHENUM\\"):
         logger.warning("Invalid instance ID format: %s", instance_id)
         return False
@@ -269,13 +374,13 @@ def reconnect_device(instance_id: str) -> bool:
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         if result.returncode == 0:
-            logger.info("Reconnect command sent for %s", instance_id)
+            logger.info("PnP reconnect command sent for %s", instance_id)
             return True
         else:
-            logger.warning("Enable failed: %s", result.stderr.strip())
+            logger.warning("PnP enable failed: %s", result.stderr.strip())
             return False
     except Exception as e:
-        logger.error("Reconnect error for %s: %s", instance_id, e)
+        logger.error("PnP reconnect error for %s: %s", instance_id, e)
         return False
 
 
@@ -630,6 +735,7 @@ class BluetoothPersistenceApp:
         menu = pystray.Menu(
             item("Monitored Devices", pystray.Menu(self._build_device_menu)),
             item("Add Device...", self._on_add_device),
+            item("Reconnect All", self._on_reconnect_all),
             pystray.Menu.SEPARATOR,
             item(
                 "Start with Windows",
@@ -654,7 +760,7 @@ class BluetoothPersistenceApp:
         for dev in self.config.get("devices", []):
             name = dev["name"]
             iid = dev["instance_id"]
-            connected = is_device_connected(iid)
+            connected = is_device_connected(name)
             status = "Connected" if connected else "Disconnected"
             label = f"{name} — {status}"
             items.append(
@@ -673,24 +779,45 @@ class BluetoothPersistenceApp:
         """Show paired devices for user to select."""
         threading.Thread(target=self._add_device_dialog, daemon=True).start()
 
+    def _on_reconnect_all(self, icon, menu_item):
+        """Manually trigger reconnection of all monitored devices."""
+        def _reconnect():
+            with self._lock:
+                devices = list(self.config.get("devices", []))
+            if not devices:
+                return
+            for dev in devices:
+                name = dev["name"]
+                iid = dev["instance_id"]
+                if not is_device_connected(name):
+                    logger.info("Manual reconnect: '%s'", name)
+                    reconnect_device(name, iid)
+            time.sleep(3)
+            connected = [d["name"] for d in devices if is_device_connected(d["name"])]
+            if connected and self.icon:
+                self.icon.notify(f"Connected: {', '.join(connected)}", APP_DISPLAY_NAME)
+        threading.Thread(target=_reconnect, daemon=True).start()
+
     def _add_device_dialog(self):
         try:
             logger.info("Add Device dialog requested.")
             devices = get_paired_devices()
             logger.info("Found %d paired device(s).", len(devices))
+            for d in devices:
+                logger.info("  Device: %s, status: %s", d["name"], d["status"])
             monitored_ids = {d["instance_id"] for d in self.config.get("devices", [])}
-            # Only show devices that are currently connected AND not already monitored
+            # Show all paired devices not already monitored
             available = [
                 d for d in devices
-                if d["instance_id"] not in monitored_ids and d.get("status") == "OK"
+                if d["instance_id"] not in monitored_ids
             ]
-            logger.info("Available (connected, not already monitored): %d", len(available))
+            logger.info("Available (not already monitored): %d", len(available))
 
             if not available:
                 ctypes.windll.user32.MessageBoxW(
                     0,
-                    "No connected Bluetooth devices available to add.\n\n"
-                    "Make sure your device is paired and connected in Windows Bluetooth settings.",
+                    "No Bluetooth devices available to add.\n\n"
+                    "Make sure your device is paired in Windows Bluetooth settings.",
                     APP_DISPLAY_NAME,
                     0x40,
                 )
@@ -760,7 +887,7 @@ class BluetoothPersistenceApp:
                 iid = dev["instance_id"]
                 name = dev["name"]
 
-                if is_device_connected(iid):
+                if is_device_connected(name):
                     # Reset back-off on successful connection
                     self._backoff.pop(iid, None)
                     continue
@@ -769,11 +896,11 @@ class BluetoothPersistenceApp:
                 interval = self._backoff.get(iid, RECONNECT_INTERVAL)
                 logger.info("Device '%s' disconnected. Attempting reconnect...", name)
 
-                success = reconnect_device(iid)
+                success = reconnect_device(name, iid)
                 if success:
                     # Wait and verify
                     time.sleep(3)
-                    if is_device_connected(iid):
+                    if is_device_connected(name):
                         logger.info("Successfully reconnected '%s'.", name)
                         self._backoff.pop(iid, None)
                         if self.icon:
