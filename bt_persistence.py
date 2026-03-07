@@ -63,12 +63,104 @@ def save_config(cfg: dict):
 
 
 # ── Bluetooth helpers (uses Windows btcom / PowerShell) ────────────────────────
+
+def _get_connected_bt_names() -> set[str]:
+    """Use Windows Bluetooth API to get names of truly connected devices."""
+    try:
+        bt = ctypes.WinDLL("bthprops.cpl")
+    except OSError:
+        try:
+            bt = ctypes.WinDLL("BluetoothAPIs.dll")
+        except OSError:
+            logger.warning("Could not load Bluetooth API DLL")
+            return set()
+
+    class SYSTEMTIME(ctypes.Structure):
+        _fields_ = [
+            ("wYear", ctypes.c_ushort), ("wMonth", ctypes.c_ushort),
+            ("wDayOfWeek", ctypes.c_ushort), ("wDay", ctypes.c_ushort),
+            ("wHour", ctypes.c_ushort), ("wMinute", ctypes.c_ushort),
+            ("wSecond", ctypes.c_ushort), ("wMilliseconds", ctypes.c_ushort),
+        ]
+
+    class BLUETOOTH_DEVICE_INFO(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.c_ulong),
+            ("Address", ctypes.c_ulonglong),
+            ("ulClassofDevice", ctypes.c_ulong),
+            ("fConnected", ctypes.c_int),
+            ("fRemembered", ctypes.c_int),
+            ("fAuthenticated", ctypes.c_int),
+            ("stLastSeen", SYSTEMTIME),
+            ("stLastUsed", SYSTEMTIME),
+            ("szName", ctypes.c_wchar * 248),
+        ]
+
+    class BLUETOOTH_DEVICE_SEARCH_PARAMS(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.c_ulong),
+            ("fReturnAuthenticated", ctypes.c_int),
+            ("fReturnRemembered", ctypes.c_int),
+            ("fReturnUnknown", ctypes.c_int),
+            ("fReturnConnected", ctypes.c_int),
+            ("fIssueInquiry", ctypes.c_int),
+            ("cTimeoutMultiplier", ctypes.c_ubyte),
+            ("hRadio", ctypes.c_void_p),
+        ]
+
+    try:
+        # Set proper argtypes/restype for 64-bit handle compatibility
+        bt.BluetoothFindFirstDevice.restype = ctypes.c_void_p
+        bt.BluetoothFindFirstDevice.argtypes = [
+            ctypes.POINTER(BLUETOOTH_DEVICE_SEARCH_PARAMS),
+            ctypes.POINTER(BLUETOOTH_DEVICE_INFO),
+        ]
+        bt.BluetoothFindNextDevice.restype = ctypes.c_int
+        bt.BluetoothFindNextDevice.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(BLUETOOTH_DEVICE_INFO),
+        ]
+        bt.BluetoothFindDeviceClose.restype = ctypes.c_int
+        bt.BluetoothFindDeviceClose.argtypes = [ctypes.c_void_p]
+
+        params = BLUETOOTH_DEVICE_SEARCH_PARAMS()
+        params.dwSize = ctypes.sizeof(BLUETOOTH_DEVICE_SEARCH_PARAMS)
+        params.fReturnConnected = 1
+        params.fReturnRemembered = 0
+        params.fReturnAuthenticated = 0
+        params.fReturnUnknown = 0
+        params.fIssueInquiry = 0
+        params.cTimeoutMultiplier = 0
+        params.hRadio = None
+
+        dev = BLUETOOTH_DEVICE_INFO()
+        dev.dwSize = ctypes.sizeof(BLUETOOTH_DEVICE_INFO)
+
+        connected = set()
+        hFind = bt.BluetoothFindFirstDevice(ctypes.byref(params), ctypes.byref(dev))
+        if hFind:
+            if dev.fConnected:
+                connected.add(dev.szName)
+            while bt.BluetoothFindNextDevice(hFind, ctypes.byref(dev)):
+                if dev.fConnected:
+                    connected.add(dev.szName)
+            bt.BluetoothFindDeviceClose(hFind)
+
+        logger.info("Bluetooth API reports connected: %s", connected)
+        return connected
+    except Exception as e:
+        logger.error("Error querying Bluetooth API: %s", e)
+        return set()
+
+
 def get_paired_devices() -> list[dict]:
     """
     Enumerate paired Bluetooth devices via PowerShell.
     Returns deduplicated list of dicts with 'name', 'instance_id', 'status'.
-    Filters out transport/service entries to show only actual devices.
+    Uses Windows Bluetooth API for actual connection status.
     """
+    # Get truly connected device names from Windows Bluetooth API
+    connected_names = _get_connected_bt_names()
+
     ps_script = (
         "Get-PnpDevice -Class Bluetooth | "
         "Where-Object { $_.FriendlyName -and $_.InstanceId -match 'BTHENUM' } | "
@@ -112,12 +204,14 @@ def get_paired_devices() -> list[dict]:
             name_lower = name.lower()
             if any(skip in name_lower for skip in SKIP_PATTERNS):
                 continue
-            # Keep the best entry per device name (prefer connected)
+            # Keep the best entry per device name (prefer OK PnP status for instance_id)
             if name not in seen_names or status == "OK":
+                # Use Bluetooth API to determine actual connection, not PnP status
+                actual_status = "OK" if name in connected_names else "Disconnected"
                 seen_names[name] = {
                     "name": name,
                     "instance_id": instance_id,
-                    "status": status,
+                    "status": actual_status,
                 }
         return list(seen_names.values())
     except Exception as e:
@@ -126,9 +220,10 @@ def get_paired_devices() -> list[dict]:
 
 
 def is_device_connected(instance_id: str) -> bool:
-    """Check if a specific Bluetooth device is connected."""
+    """Check if a specific Bluetooth device is connected using Windows Bluetooth API."""
+    # Get the device name from PnP, then check against BT API
     ps_script = (
-        f"(Get-PnpDevice -InstanceId '{instance_id}' -ErrorAction SilentlyContinue).Status"
+        f"(Get-PnpDevice -InstanceId '{instance_id}' -ErrorAction SilentlyContinue).FriendlyName"
     )
     try:
         result = subprocess.run(
@@ -136,8 +231,11 @@ def is_device_connected(instance_id: str) -> bool:
             capture_output=True, text=True, timeout=15,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        status = result.stdout.strip()
-        return status == "OK"
+        name = result.stdout.strip()
+        if not name:
+            return False
+        connected_names = _get_connected_bt_names()
+        return name in connected_names
     except Exception as e:
         logger.error("Error checking device status: %s", e)
         return False
