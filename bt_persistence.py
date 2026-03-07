@@ -250,6 +250,13 @@ def _show_device_picker(devices: list[dict]) -> int | None:
     kernel32 = ctypes.windll.kernel32
     gdi32 = ctypes.windll.gdi32
 
+    # Fix 64-bit compatibility for DefWindowProcW
+    user32.DefWindowProcW.argtypes = [
+        ctypes.wintypes.HWND, ctypes.c_uint,
+        ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
+    ]
+    user32.DefWindowProcW.restype = ctypes.c_longlong
+
     # Win32 constants
     WS_OVERLAPPED = 0x00000000
     WS_CAPTION = 0x00C00000
@@ -294,12 +301,26 @@ def _show_device_picker(devices: list[dict]) -> int | None:
     ODS_SELECTED = 0x0001
 
     WNDPROC = ctypes.WINFUNCTYPE(
-        ctypes.c_long,
+        ctypes.c_longlong,
         ctypes.wintypes.HWND,
         ctypes.c_uint,
         ctypes.wintypes.WPARAM,
         ctypes.wintypes.LPARAM,
     )
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [
+            ("style", ctypes.c_uint),
+            ("lpfnWndProc", WNDPROC),
+            ("cbClsExtra", ctypes.c_int),
+            ("cbWndExtra", ctypes.c_int),
+            ("hInstance", ctypes.wintypes.HINSTANCE),
+            ("hIcon", ctypes.wintypes.HICON),
+            ("hCursor", ctypes.wintypes.HANDLE),
+            ("hbrBackground", ctypes.wintypes.HBRUSH),
+            ("lpszMenuName", ctypes.wintypes.LPCWSTR),
+            ("lpszClassName", ctypes.wintypes.LPCWSTR),
+        ]
 
     ID_LISTBOX = 100
     ID_OK = 101
@@ -466,7 +487,7 @@ def _show_device_picker(devices: list[dict]) -> int | None:
     wnd_proc_cb = WNDPROC(wnd_proc)
 
     class_name = f"{APP_NAME}_DevicePicker"
-    wc = ctypes.wintypes.WNDCLASSW()
+    wc = WNDCLASSW()
     wc.lpfnWndProc = wnd_proc_cb
     wc.hInstance = kernel32.GetModuleHandleW(None)
     wc.lpszClassName = class_name
