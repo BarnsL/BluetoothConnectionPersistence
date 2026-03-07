@@ -241,7 +241,6 @@ def create_icon_image(connected: bool = False) -> Image.Image:
 def _show_device_picker(devices: list[dict]) -> int | None:
     """
     Show a native Win32 dialog with a listbox of Bluetooth devices.
-    Each entry shows the device name and its status (Connected / Disconnected).
     Returns the selected index, or None if cancelled.
     """
     import ctypes.wintypes
@@ -250,43 +249,21 @@ def _show_device_picker(devices: list[dict]) -> int | None:
     kernel32 = ctypes.windll.kernel32
     gdi32 = ctypes.windll.gdi32
 
-    # Fix 64-bit compatibility — set argtypes/restype for all Win32 functions
-    # that pass or return handles (pointers) which can exceed 32 bits
-    HWND = ctypes.wintypes.HWND
-    HINSTANCE = ctypes.wintypes.HINSTANCE
-    HMENU = ctypes.wintypes.HMENU
-    LPVOID = ctypes.c_void_p
-    LPCWSTR = ctypes.wintypes.LPCWSTR
-    DWORD = ctypes.wintypes.DWORD
-    INT = ctypes.c_int
-    BOOL = ctypes.wintypes.BOOL
-    UINT = ctypes.c_uint
-    WPARAM = ctypes.wintypes.WPARAM
-    LPARAM = ctypes.wintypes.LPARAM
-    LRESULT = ctypes.c_longlong
-
-    user32.DefWindowProcW.argtypes = [HWND, UINT, WPARAM, LPARAM]
-    user32.DefWindowProcW.restype = LRESULT
-
+    # 64-bit compatibility: only set argtypes on calls that overflow without them
     user32.CreateWindowExW.argtypes = [
-        DWORD, LPCWSTR, LPCWSTR, DWORD,
-        INT, INT, INT, INT,
-        HWND, HMENU, HINSTANCE, LPVOID,
+        ctypes.wintypes.DWORD, ctypes.wintypes.LPCWSTR, ctypes.wintypes.LPCWSTR,
+        ctypes.wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.wintypes.HWND, ctypes.wintypes.HMENU, ctypes.wintypes.HINSTANCE,
+        ctypes.c_void_p,
     ]
-    user32.CreateWindowExW.restype = HWND
-
-    user32.RegisterClassW.restype = ctypes.wintypes.ATOM
-
-    user32.SendMessageW.argtypes = [HWND, UINT, WPARAM, LPARAM]
-    user32.SendMessageW.restype = LRESULT
-
-    kernel32.GetModuleHandleW.argtypes = [LPCWSTR]
-    kernel32.GetModuleHandleW.restype = HINSTANCE
-
-    gdi32.CreateSolidBrush.restype = ctypes.wintypes.HBRUSH
-    gdi32.CreateFontW.restype = ctypes.wintypes.HANDLE
-
-    user32.LoadCursorW.restype = ctypes.wintypes.HANDLE
+    user32.CreateWindowExW.restype = ctypes.wintypes.HWND
+    user32.DefWindowProcW.argtypes = [
+        ctypes.wintypes.HWND, ctypes.c_uint,
+        ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
+    ]
+    user32.DefWindowProcW.restype = ctypes.c_longlong
+    kernel32.GetModuleHandleW.argtypes = [ctypes.wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = ctypes.wintypes.HINSTANCE
 
     # Win32 constants
     WS_OVERLAPPED = 0x00000000
@@ -300,36 +277,17 @@ def _show_device_picker(devices: list[dict]) -> int | None:
     WS_EX_DLGMODALFRAME = 0x00000001
     LBS_NOTIFY = 0x0001
     LBS_NOINTEGRALHEIGHT = 0x0100
-    LBS_OWNERDRAWFIXED = 0x0010
-    LBS_HASSTRINGS = 0x0040
     BS_DEFPUSHBUTTON = 0x0001
     BS_PUSHBUTTON = 0x0000
-    WM_CREATE = 0x0001
     WM_DESTROY = 0x0002
     WM_CLOSE = 0x0010
     WM_COMMAND = 0x0111
     WM_SETFONT = 0x0030
-    WM_DRAWITEM = 0x002B
-    WM_MEASUREITEM = 0x002C
-    WM_CTLCOLORLISTBOX = 0x0134
-    WM_CTLCOLORBTN = 0x0135
-    WM_CTLCOLORSTATIC = 0x0138
-    WM_CTLCOLORDLG = 0x0136
-    WM_ERASEBKGND = 0x0014
     LB_ADDSTRING = 0x0180
     LB_GETCURSEL = 0x0188
     LB_SETCURSEL = 0x0186
-    LB_SETITEMDATA = 0x019A
-    LB_GETITEMDATA = 0x0199
     LBN_DBLCLK = 2
     BN_CLICKED = 0
-    SW_SHOW = 5
-    COLOR_WINDOW = 5
-    ODA_DRAWENTIRE = 0x0001
-    ODA_SELECT = 0x0002
-    ODA_FOCUS = 0x0004
-    ODT_LISTBOX = 2
-    ODS_SELECTED = 0x0001
 
     WNDPROC = ctypes.WINFUNCTYPE(
         ctypes.c_longlong,
@@ -360,129 +318,8 @@ def _show_device_picker(devices: list[dict]) -> int | None:
     result_holder = [None]
     hwnd_listbox = [None]
 
-    # Dark theme colors
-    BG_COLOR = 0x00282828        # #282828 (dark bg)
-    TEXT_COLOR = 0x00FFFFFF       # white text
-    ACCENT_COLOR = 0x00D77800    # #0078D7 (blue accent) — BGR
-    ITEM_BG = 0x00323232         # #323232 (item bg)
-    CONNECTED_COLOR = 0x0066CC66  # green — BGR
-    DISCONNECTED_COLOR = 0x005050AA  # muted red — BGR
-    SEPARATOR_COLOR = 0x00444444
-
-    bg_brush = gdi32.CreateSolidBrush(BG_COLOR)
-    item_brush = gdi32.CreateSolidBrush(ITEM_BG)
-    accent_brush = gdi32.CreateSolidBrush(ACCENT_COLOR)
-
-    class DRAWITEMSTRUCT(ctypes.Structure):
-        _fields_ = [
-            ("CtlType", ctypes.c_uint),
-            ("CtlID", ctypes.c_uint),
-            ("itemID", ctypes.c_uint),
-            ("itemAction", ctypes.c_uint),
-            ("itemState", ctypes.c_uint),
-            ("hwndItem", ctypes.wintypes.HWND),
-            ("hDC", ctypes.wintypes.HDC),
-            ("rcItem", ctypes.wintypes.RECT),
-            ("itemData", ctypes.POINTER(ctypes.c_ulong)),
-        ]
-
-    class MEASUREITEMSTRUCT(ctypes.Structure):
-        _fields_ = [
-            ("CtlType", ctypes.c_uint),
-            ("CtlID", ctypes.c_uint),
-            ("itemID", ctypes.c_uint),
-            ("itemWidth", ctypes.c_uint),
-            ("itemHeight", ctypes.c_uint),
-            ("itemData", ctypes.POINTER(ctypes.c_ulong)),
-        ]
-
     def wnd_proc(hwnd, msg, wparam, lparam):
-        if msg == WM_CREATE:
-            return 0
-
-        elif msg == WM_ERASEBKGND:
-            hdc = wparam
-            rect = ctypes.wintypes.RECT()
-            user32.GetClientRect(hwnd, ctypes.byref(rect))
-            user32.FillRect(hdc, ctypes.byref(rect), bg_brush)
-            return 1
-
-        elif msg == WM_CTLCOLORLISTBOX:
-            hdc = wparam
-            gdi32.SetTextColor(hdc, TEXT_COLOR)
-            gdi32.SetBkColor(hdc, ITEM_BG)
-            return item_brush
-
-        elif msg in (WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_CTLCOLORDLG):
-            hdc = wparam
-            gdi32.SetTextColor(hdc, TEXT_COLOR)
-            gdi32.SetBkColor(hdc, BG_COLOR)
-            return bg_brush
-
-        elif msg == WM_MEASUREITEM:
-            mis = ctypes.cast(lparam, ctypes.POINTER(MEASUREITEMSTRUCT)).contents
-            mis.itemHeight = 48
-            return 1
-
-        elif msg == WM_DRAWITEM:
-            dis = ctypes.cast(lparam, ctypes.POINTER(DRAWITEMSTRUCT)).contents
-            if dis.CtlID != ID_LISTBOX:
-                return 0
-
-            hdc = dis.hDC
-            rc = dis.rcItem
-            selected = bool(dis.itemState & ODS_SELECTED)
-            idx = dis.itemID
-
-            if idx >= len(devices):
-                return 0
-
-            # Background
-            fill_brush = accent_brush if selected else item_brush
-            user32.FillRect(hdc, ctypes.byref(rc), fill_brush)
-
-            # Draw separator line at bottom
-            sep_rect = ctypes.wintypes.RECT(rc.left, rc.bottom - 1, rc.right, rc.bottom)
-            sep_brush = gdi32.CreateSolidBrush(SEPARATOR_COLOR)
-            user32.FillRect(hdc, ctypes.byref(sep_rect), sep_brush)
-            gdi32.DeleteObject(sep_brush)
-
-            gdi32.SetBkMode(hdc, 1)  # TRANSPARENT
-
-            dev = devices[idx]
-            name = dev["name"]
-            is_connected = dev.get("status", "Unknown") == "OK"
-            status_text = "Connected" if is_connected else "Disconnected"
-
-            # Draw device name (bold, larger)
-            name_font = gdi32.CreateFontW(
-                -18, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, "Segoe UI"
-            )
-            old_font = gdi32.SelectObject(hdc, name_font)
-            gdi32.SetTextColor(hdc, 0x00FFFFFF if selected else 0x00EEEEEE)
-            name_rect = ctypes.wintypes.RECT(rc.left + 14, rc.top + 6, rc.right - 14, rc.top + 28)
-            user32.DrawTextW(hdc, name, -1, ctypes.byref(name_rect), 0x0000)
-            gdi32.SelectObject(hdc, old_font)
-            gdi32.DeleteObject(name_font)
-
-            # Draw status (smaller, colored)
-            status_font = gdi32.CreateFontW(
-                -13, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, "Segoe UI"
-            )
-            old_font2 = gdi32.SelectObject(hdc, status_font)
-            status_color = CONNECTED_COLOR if is_connected else DISCONNECTED_COLOR
-            gdi32.SetTextColor(hdc, status_color)
-            status_rect = ctypes.wintypes.RECT(rc.left + 14, rc.top + 27, rc.right - 14, rc.bottom - 4)
-            # Draw a small circle indicator
-            indicator = "\u25CF "  # ● bullet
-            full_status = indicator + status_text
-            user32.DrawTextW(hdc, full_status, -1, ctypes.byref(status_rect), 0x0000)
-            gdi32.SelectObject(hdc, old_font2)
-            gdi32.DeleteObject(status_font)
-
-            return 1
-
-        elif msg == WM_COMMAND:
+        if msg == WM_COMMAND:
             control_id = wparam & 0xFFFF
             notify_code = (wparam >> 16) & 0xFFFF
 
@@ -514,21 +351,22 @@ def _show_device_picker(devices: list[dict]) -> int | None:
 
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
-    # prevent GC of the callback
     wnd_proc_cb = WNDPROC(wnd_proc)
 
     class_name = f"{APP_NAME}_DevicePicker"
+    hInstance = kernel32.GetModuleHandleW(None)
+
     wc = WNDCLASSW()
     wc.lpfnWndProc = wnd_proc_cb
-    wc.hInstance = kernel32.GetModuleHandleW(None)
+    wc.hInstance = hInstance
     wc.lpszClassName = class_name
-    wc.hCursor = user32.LoadCursorW(None, 32512)  # IDC_ARROW
-    wc.hbrBackground = bg_brush
+    wc.hCursor = user32.LoadCursorW(None, 32512)
+    wc.hbrBackground = ctypes.wintypes.HBRUSH(6)  # COLOR_BTNFACE + 1
 
     user32.RegisterClassW(ctypes.byref(wc))
 
     # Center on screen
-    dlg_w, dlg_h = 420, 480
+    dlg_w, dlg_h = 400, 380
     screen_w = user32.GetSystemMetrics(0)
     screen_h = user32.GetSystemMetrics(1)
     x = (screen_w - dlg_w) // 2
@@ -540,40 +378,41 @@ def _show_device_picker(devices: list[dict]) -> int | None:
         "Select Bluetooth Device",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         x, y, dlg_w, dlg_h,
-        None, None, wc.hInstance, None,
+        None, None, hInstance, None,
     )
 
-    # UI font
-    ui_font = gdi32.CreateFontW(-14, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, "Segoe UI")
+    ui_font = gdi32.CreateFontW(-16, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, "Segoe UI")
 
     # Label
     h_label = user32.CreateWindowExW(
         0, "STATIC",
-        "Select a paired device to monitor for auto-reconnect:",
+        "Select a device to monitor for auto-reconnect:",
         WS_CHILD | WS_VISIBLE,
-        14, 12, 380, 22,
-        hwnd, None, wc.hInstance, None,
+        14, 10, 360, 22,
+        hwnd, None, hInstance, None,
     )
     user32.SendMessageW(h_label, WM_SETFONT, ui_font, 1)
 
-    # Listbox (owner-drawn)
+    # Standard listbox (no owner-draw)
     lb_style = (
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WS_TABSTOP
-        | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS
+        | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT
     )
     h_listbox = user32.CreateWindowExW(
         0, "LISTBOX", None,
         lb_style,
-        14, 40, 378, 340,
-        hwnd, ctypes.wintypes.HMENU(ID_LISTBOX), wc.hInstance, None,
+        14, 38, 358, 240,
+        hwnd, ctypes.wintypes.HMENU(ID_LISTBOX), hInstance, None,
     )
     hwnd_listbox[0] = h_listbox
+    user32.SendMessageW(h_listbox, WM_SETFONT, ui_font, 1)
 
-    for i, dev in enumerate(devices):
-        label = dev["name"]
-        user32.SendMessageW(h_listbox, LB_ADDSTRING, 0, ctypes.cast(ctypes.c_wchar_p(label), ctypes.c_void_p).value or 0)
+    # Add items as formatted text strings
+    for dev in devices:
+        status = "\u2713 Connected" if dev.get("status") == "OK" else "\u2717 Disconnected"
+        label = f"{dev['name']}  —  {status}"
+        user32.SendMessageW(h_listbox, LB_ADDSTRING, 0, label)
 
-    # Select first item
     user32.SendMessageW(h_listbox, LB_SETCURSEL, 0, 0)
 
     # Buttons
@@ -582,16 +421,16 @@ def _show_device_picker(devices: list[dict]) -> int | None:
     h_ok = user32.CreateWindowExW(
         0, "BUTTON", "Add Device",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-        142, 395, 120, 36,
-        hwnd, ctypes.wintypes.HMENU(ID_OK), wc.hInstance, None,
+        130, 290, 110, 34,
+        hwnd, ctypes.wintypes.HMENU(ID_OK), hInstance, None,
     )
     user32.SendMessageW(h_ok, WM_SETFONT, btn_font, 1)
 
     h_cancel = user32.CreateWindowExW(
         0, "BUTTON", "Cancel",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        272, 395, 120, 36,
-        hwnd, ctypes.wintypes.HMENU(ID_CANCEL), wc.hInstance, None,
+        250, 290, 110, 34,
+        hwnd, ctypes.wintypes.HMENU(ID_CANCEL), hInstance, None,
     )
     user32.SendMessageW(h_cancel, WM_SETFONT, btn_font, 1)
 
@@ -605,10 +444,7 @@ def _show_device_picker(devices: list[dict]) -> int | None:
     # Cleanup
     gdi32.DeleteObject(ui_font)
     gdi32.DeleteObject(btn_font)
-    gdi32.DeleteObject(bg_brush)
-    gdi32.DeleteObject(item_brush)
-    gdi32.DeleteObject(accent_brush)
-    user32.UnregisterClassW(class_name, wc.hInstance)
+    user32.UnregisterClassW(class_name, hInstance)
 
     return result_holder[0]
 
