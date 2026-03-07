@@ -250,12 +250,43 @@ def _show_device_picker(devices: list[dict]) -> int | None:
     kernel32 = ctypes.windll.kernel32
     gdi32 = ctypes.windll.gdi32
 
-    # Fix 64-bit compatibility for DefWindowProcW
-    user32.DefWindowProcW.argtypes = [
-        ctypes.wintypes.HWND, ctypes.c_uint,
-        ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
+    # Fix 64-bit compatibility — set argtypes/restype for all Win32 functions
+    # that pass or return handles (pointers) which can exceed 32 bits
+    HWND = ctypes.wintypes.HWND
+    HINSTANCE = ctypes.wintypes.HINSTANCE
+    HMENU = ctypes.wintypes.HMENU
+    LPVOID = ctypes.c_void_p
+    LPCWSTR = ctypes.wintypes.LPCWSTR
+    DWORD = ctypes.wintypes.DWORD
+    INT = ctypes.c_int
+    BOOL = ctypes.wintypes.BOOL
+    UINT = ctypes.c_uint
+    WPARAM = ctypes.wintypes.WPARAM
+    LPARAM = ctypes.wintypes.LPARAM
+    LRESULT = ctypes.c_longlong
+
+    user32.DefWindowProcW.argtypes = [HWND, UINT, WPARAM, LPARAM]
+    user32.DefWindowProcW.restype = LRESULT
+
+    user32.CreateWindowExW.argtypes = [
+        DWORD, LPCWSTR, LPCWSTR, DWORD,
+        INT, INT, INT, INT,
+        HWND, HMENU, HINSTANCE, LPVOID,
     ]
-    user32.DefWindowProcW.restype = ctypes.c_longlong
+    user32.CreateWindowExW.restype = HWND
+
+    user32.RegisterClassW.restype = ctypes.wintypes.ATOM
+
+    user32.SendMessageW.argtypes = [HWND, UINT, WPARAM, LPARAM]
+    user32.SendMessageW.restype = LRESULT
+
+    kernel32.GetModuleHandleW.argtypes = [LPCWSTR]
+    kernel32.GetModuleHandleW.restype = HINSTANCE
+
+    gdi32.CreateSolidBrush.restype = ctypes.wintypes.HBRUSH
+    gdi32.CreateFontW.restype = ctypes.wintypes.HANDLE
+
+    user32.LoadCursorW.restype = ctypes.wintypes.HANDLE
 
     # Win32 constants
     WS_OVERLAPPED = 0x00000000
@@ -534,13 +565,13 @@ def _show_device_picker(devices: list[dict]) -> int | None:
         0, "LISTBOX", None,
         lb_style,
         14, 40, 378, 340,
-        hwnd, ID_LISTBOX, wc.hInstance, None,
+        hwnd, ctypes.wintypes.HMENU(ID_LISTBOX), wc.hInstance, None,
     )
     hwnd_listbox[0] = h_listbox
 
     for i, dev in enumerate(devices):
         label = dev["name"]
-        user32.SendMessageW(h_listbox, LB_ADDSTRING, 0, label)
+        user32.SendMessageW(h_listbox, LB_ADDSTRING, 0, ctypes.cast(ctypes.c_wchar_p(label), ctypes.c_void_p).value or 0)
 
     # Select first item
     user32.SendMessageW(h_listbox, LB_SETCURSEL, 0, 0)
@@ -552,7 +583,7 @@ def _show_device_picker(devices: list[dict]) -> int | None:
         0, "BUTTON", "Add Device",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
         142, 395, 120, 36,
-        hwnd, ID_OK, wc.hInstance, None,
+        hwnd, ctypes.wintypes.HMENU(ID_OK), wc.hInstance, None,
     )
     user32.SendMessageW(h_ok, WM_SETFONT, btn_font, 1)
 
@@ -560,7 +591,7 @@ def _show_device_picker(devices: list[dict]) -> int | None:
         0, "BUTTON", "Cancel",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
         272, 395, 120, 36,
-        hwnd, ID_CANCEL, wc.hInstance, None,
+        hwnd, ctypes.wintypes.HMENU(ID_CANCEL), wc.hInstance, None,
     )
     user32.SendMessageW(h_cancel, WM_SETFONT, btn_font, 1)
 
