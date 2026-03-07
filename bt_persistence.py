@@ -663,18 +663,18 @@ class BluetoothPersistenceApp:
             devices = get_paired_devices()
             logger.info("Found %d paired device(s).", len(devices))
             monitored_ids = {d["instance_id"] for d in self.config.get("devices", [])}
-            # Show all paired devices that are not already monitored
+            # Only show devices that are currently connected AND not already monitored
             available = [
                 d for d in devices
-                if d["instance_id"] not in monitored_ids
+                if d["instance_id"] not in monitored_ids and d.get("status") == "OK"
             ]
-            logger.info("Available (not already monitored): %d", len(available))
+            logger.info("Available (connected, not already monitored): %d", len(available))
 
             if not available:
                 ctypes.windll.user32.MessageBoxW(
                     0,
-                    "No Bluetooth devices available to add.\n\n"
-                    "Make sure your device is paired in Windows Bluetooth settings.",
+                    "No connected Bluetooth devices available to add.\n\n"
+                    "Make sure your device is paired and connected in Windows Bluetooth settings.",
                     APP_DISPLAY_NAME,
                     0x40,
                 )
